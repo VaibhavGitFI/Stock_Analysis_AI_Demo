@@ -3,7 +3,7 @@ import { UserCircle, TrendingUp, LogOut } from 'lucide-react';
 import ChatSidebar from './components/ChatSidebar';
 import ChatThread from './components/ChatThread';
 import ChatInput from './components/ChatInput';
-import { analyzeTranscript } from './api';
+import { analyzeTranscript, compareStocks, isCompareQuery } from './api';
 
 const uid = () => crypto.randomUUID?.() || String(Date.now()) + Math.random().toString(36).slice(2);
 
@@ -89,7 +89,9 @@ export default function App() {
     }, 900);
 
     try {
-      const data = await analyzeTranscript(text.trim());
+      const data = isCompareQuery(text.trim())
+        ? await compareStocks(text.trim())
+        : await analyzeTranscript(text.trim());
       clearInterval(timerRef.current);
       setStage(4);
       await new Promise(r => setTimeout(r, 350));
@@ -98,7 +100,9 @@ export default function App() {
         c.id === convId
           ? {
               ...c,
-              title: data.ticker ? `${data.ticker} — ${makeTitle(text)}` : c.title,
+              title: data.type === 'comparison'
+                ? `Compare: ${(data.items||[]).slice(0,3).map(i=>i.ticker).join(' vs ')}`
+                : data.ticker ? `${data.ticker} — ${makeTitle(text)}` : c.title,
               messages: c.messages.map(m =>
                 m.id === assistantMsgId ? { ...m, loading: false, data } : m
               ),
@@ -164,16 +168,20 @@ export default function App() {
           }}>
             <TrendingUp size={15} color="#fff" strokeWidth={2.5} />
           </div>
-          <span style={{
-            fontSize: 15, fontWeight: 700, color: '#f3f4f6', letterSpacing: '-0.01em',
-            whiteSpace: 'nowrap',
+          <div style={{
             opacity: sidebarOpen ? 1 : 0,
             width: sidebarOpen ? 'auto' : 0,
             overflow: 'hidden',
             transition: 'opacity 0.2s ease, width 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+            display: 'flex', flexDirection: 'column',
           }}>
-            Stock AI
-          </span>
+            <span style={{ fontSize: 14, fontWeight: 700, color: '#f3f4f6', letterSpacing: '-0.01em', whiteSpace: 'nowrap', lineHeight: 1.2 }}>
+              ENAM Research Terminal
+            </span>
+            <span style={{ fontSize: 10, color: '#6b7280', whiteSpace: 'nowrap', letterSpacing: '0.02em' }}>
+              ENAM AMC · PMS
+            </span>
+          </div>
         </div>
 
         {/* Right — profile */}
@@ -267,15 +275,13 @@ export default function App() {
 
         {/* Center — branding */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          <span style={{ opacity: 0.7 }}>Developed By</span>
+          <span style={{ color: '#9ca3af', fontSize: 11 }}>Powered by</span>
           <span style={{
-            fontWeight: 700,
-            background: 'linear-gradient(90deg, #0d9488, #2563eb)',
-            WebkitBackgroundClip: 'text',
-            WebkitTextFillColor: 'transparent',
+            fontWeight: 700, fontSize: 11,
+            color: '#ffffff',
             letterSpacing: '0.03em',
           }}>
-            Fristine Infotech
+            ENAM AMC Research Terminal
           </span>
         </div>
       </footer>

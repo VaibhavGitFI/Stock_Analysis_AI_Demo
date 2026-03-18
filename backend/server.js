@@ -7,6 +7,11 @@ const path     = require("path");
 const fetch    = require("node-fetch");
 const FormData = require("form-data");
 
+// ─── ENAM Portfolio Database ────────────────────────────────────────────────
+const PORTFOLIO = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "data", "portfolio.json"), "utf8")
+);
+
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
@@ -529,6 +534,264 @@ All scores are integers 0–100. Be specific and grounded for the specific stock
 
   } catch (err) {
     console.error("Analysis error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PORTFOLIO DATA ─────────────────────────────────────────────────────────
+app.get("/api/portfolio", (_req, res) => {
+  res.json({
+    group:           PORTFOLIO.group,
+    pmsPortfolio:    PORTFOLIO.pmsPortfolio,
+    watchlist:       PORTFOLIO.watchlist,
+    sectorAllocation: PORTFOLIO.pmsPortfolio?.sectorAllocation || PORTFOLIO.sectorAllocation,
+    performanceSummary: {
+      fundReturnYTD:      PORTFOLIO.pmsPortfolio?.fundReturnYTD,
+      benchmarkReturnYTD: PORTFOLIO.pmsPortfolio?.benchmarkReturnYTD,
+      alphavsBenchmark:   PORTFOLIO.pmsPortfolio?.alphavsBenchmark,
+      totalAUM:           PORTFOLIO.pmsPortfolio?.totalAUM,
+      totalClients:       PORTFOLIO.pmsPortfolio?.totalClients,
+    },
+    samplePrompts: PORTFOLIO.samplePrompts,
+  });
+});
+
+// ─── COMPARE STOCKS ─────────────────────────────────────────────────────────
+// POST /api/compare — Claude extracts tickers from query, fetches live data for
+// each, then generates a side-by-side comparison with % metrics and a winner.
+app.post("/api/compare", async (req, res) => {
+  try {
+    if (!ANTHROPIC_KEY || ANTHROPIC_KEY === "your_anthropic_api_key_here") {
+      return res.status(400).json({ error: "ANTHROPIC_API_KEY not configured in .env" });
+    }
+    const { transcript } = req.body;
+    if (!transcript) return res.status(400).json({ error: "No transcript provided" });
+
+    console.log("\nCOMPARE — Step 1: Extract tickers from query…");
+
+    // ── Build portfolio context for Claude ──────────────────────────────────
+    const holdingsList = (PORTFOLIO.pmsPortfolio?.holdings || [])
+      .map(h => `${h.ticker} (${h.companyName}, avg buy ₹${h.avgBuyPrice}, allocation ${h.allocation}%)`)
+      .join("\n");
+
+    const watchlistStr = (PORTFOLIO.watchlist || [])
+      .map(w => `${w.ticker} (${w.companyName}, ${w.sector})`)
+      .join("\n");
+
+    const systemExtract = `You are ENAM AMC's senior research analyst AI. ENAM is a premier Indian investment group managing a ₹8,420 Crore PMS portfolio.
+
+ENAM's current PMS holdings:
+${holdingsList}
+
+ENAM's watchlist:
+${watchlistStr}
+
+Given the user query, extract ALL stocks to compare. Return ONLY a valid JSON object — no markdown, no prose.
+
+Required JSON:
+{
+  "tickers": [
+    { "ticker": "BAJFINANCE", "exchange": "NSE", "companyName": "Bajaj Finance Ltd", "isPortfolioStock": true, "avgBuyPrice": 1200 },
+    { "ticker": "HDFCBANK",   "exchange": "NSE", "companyName": "HDFC Bank Ltd",     "isPortfolioStock": true, "avgBuyPrice": 680  },
+    { "ticker": "KOTAKBANK",  "exchange": "NSE", "companyName": "Kotak Mahindra Bank","isPortfolioStock": false, "avgBuyPrice": null }
+  ],
+  "comparisonContext": "Client wants to compare ENAM's two banking holdings against Kotak for possible addition",
+  "clientIntent": "Identify best risk-reward in private banking space for a 3-year horizon"
+}
+
+Rules:
+- isPortfolioStock: true if ticker is in ENAM's PMS holdings above
+- avgBuyPrice: from ENAM's portfolio data if isPortfolioStock is true, else null
+- Include at least 2 tickers
+- If query mentions "our stock", "our portfolio", "our holding", resolve to ENAM's holdings`;
+
+    const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        system: systemExtract,
+        messages: [{ role: "user", content: `Query: "${transcript}"\n\nJSON only:` }],
+      }),
+    });
+
+    if (!extractRes.ok) throw new Error(`Claude extract ${extractRes.status}: ${await extractRes.text()}`);
+    const extractData = await extractRes.json();
+    const rawExtract  = (extractData.content || []).map(b => b.text || "").join("");
+    const matchExtract = rawExtract.match(/\{[\s\S]*\}/);
+    if (!matchExtract) throw new Error("Claude returned no JSON for ticker extraction");
+
+    const extracted = JSON.parse(matchExtract[0]);
+    const tickers   = extracted.tickers || [];
+    if (tickers.length < 1) throw new Error("No valid tickers found in query");
+
+    console.log(`  Found ${tickers.length} tickers: ${tickers.map(t => t.ticker).join(", ")}`);
+
+    // ── Step 2: Fetch live Yahoo data for all tickers in parallel ───────────
+    console.log("COMPARE — Step 2: Fetching live market data…");
+    const liveData = await Promise.all(
+      tickers.map(t => fetchYahooData(t.ticker, t.exchange))
+    );
+
+    // ── Step 3: Calculate unrealised gain for portfolio stocks ───────────────
+    const enrichedItems = tickers.map((t, i) => {
+      const live = liveData[i];
+      let unrealizedGain     = null;
+      let unrealizedGainPct  = null;
+      let unrealizedGainPositive = true;
+
+      if (t.isPortfolioStock && t.avgBuyPrice && live?.priceRaw) {
+        const gain = ((live.priceRaw - t.avgBuyPrice) / t.avgBuyPrice) * 100;
+        unrealizedGainPct      = gain;
+        unrealizedGainPositive = gain >= 0;
+        unrealizedGain         = `${gain >= 0 ? "+" : ""}${gain.toFixed(1)}% since ENAM entry`;
+      }
+
+      // Find portfolio holding for extra context
+      const holding = (PORTFOLIO.pmsPortfolio?.holdings || []).find(h => h.ticker === t.ticker);
+      const watchItem = (PORTFOLIO.watchlist || []).find(w => w.ticker === t.ticker);
+
+      return {
+        ticker:              t.ticker,
+        companyName:         live?.companyName || t.companyName,
+        exchange:            t.exchange,
+        isPortfolioStock:    t.isPortfolioStock,
+        avgBuyPrice:         t.avgBuyPrice ? `₹${t.avgBuyPrice}` : null,
+        price:               live?.price      || "—",
+        priceRaw:            live?.priceRaw   || null,
+        change:              live?.change     || "—",
+        changePositive:      live?.changePositive ?? true,
+        unrealizedGain,
+        unrealizedGainPct,
+        unrealizedGainPositive,
+        peRatio:             live?.peRatio     || "N/A",
+        marketCap:           live?.marketCap   || "N/A",
+        weekHigh52:          live?.weekHigh52  || "N/A",
+        weekLow52:           live?.weekLow52   || "N/A",
+        dividendYield:       live?.dividendYield || "N/A",
+        beta:                live?.beta         || "N/A",
+        eps:                 live?.eps          || "N/A",
+        volume:              live?.volume       || "N/A",
+        // ENAM portfolio context
+        allocation:          holding?.allocation ? `${holding.allocation}%` : null,
+        category:            holding?.category   || watchItem?.watchReason   || null,
+        analystRating:       holding?.analystRating || null,
+        targetPrice:         holding?.targetPrice   || null,
+        enamsThesis:         holding?.enamsThesis   || watchItem?.watchReason || null,
+        sector:              holding?.sector || watchItem?.sector || null,
+        liveDataAvailable:   !!live,
+      };
+    });
+
+    // ── Step 4: Claude generates comparison analysis ────────────────────────
+    console.log("COMPARE — Step 3: Claude comparison analysis…");
+
+    const stockSummaries = enrichedItems.map(item => `
+${item.ticker} — ${item.companyName}
+  Current Price: ${item.price} (Day: ${item.change})
+  PE Ratio: ${item.peRatio} | Market Cap: ${item.marketCap} | 52W Range: ${item.weekLow52}–${item.weekHigh52}
+  Beta: ${item.beta} | Dividend Yield: ${item.dividendYield} | EPS: ${item.eps}
+  ENAM Portfolio: ${item.isPortfolioStock ? `YES — allocation ${item.allocation}, avg buy ${item.avgBuyPrice}, unrealised gain: ${item.unrealizedGain || "N/A"}` : "NO — on watchlist or external"}
+  ENAM Thesis: ${item.enamsThesis || "N/A"}
+  ENAM Analyst Rating: ${item.analystRating || "N/A"} | Target: ${item.targetPrice || "N/A"}
+`).join("\n");
+
+    const systemCompare = `You are ENAM AMC's senior equity research analyst. Given a comparison query and live stock data, produce a concise, data-driven comparison analysis for ENAM's broker to present to their client.
+
+Return ONLY a valid JSON object — no markdown, no prose, no code fences.
+
+Required JSON:
+{
+  "headline": "One crisp sentence summarising the comparison outcome",
+  "winner": {
+    "ticker": "BEST_TICKER",
+    "reason": "One sentence why this wins for the client's stated objective"
+  },
+  "rankings": [
+    { "rank": 1, "ticker": "BEST", "signal": "BULLISH", "recommendation": "BUY",  "score": 84, "oneLineVerdict": "Best risk-reward in the group" },
+    { "rank": 2, "ticker": "OK",   "signal": "NEUTRAL",  "recommendation": "HOLD", "score": 68, "oneLineVerdict": "Decent compounder but pricier" },
+    { "rank": 3, "ticker": "WEAK", "signal": "BEARISH",  "recommendation": "SELL", "score": 42, "oneLineVerdict": "Underperforming peers on key metrics" }
+  ],
+  "comparisonNarrative": "3-4 sentence professional analyst comparison covering relative valuations, growth outlook, and risk-reward. Reference specific PE ratios, returns, or growth rates from the data.",
+  "recommendation": "2-3 sentence clear actionable recommendation for the client, referencing their intent.",
+  "keyTable": [
+    { "metric": "PE Ratio",       "values": { "TICKER1": "28x", "TICKER2": "18x" } },
+    { "metric": "Day Change",     "values": { "TICKER1": "+1.2%", "TICKER2": "-0.4%" } },
+    { "metric": "ENAM Return",    "values": { "TICKER1": "+305%", "TICKER2": "+182%" } },
+    { "metric": "Analyst Rating", "values": { "TICKER1": "BUY", "TICKER2": "HOLD" } }
+  ]
+}
+
+Use actual data from the stock summaries provided. Be specific — cite actual numbers.`;
+
+    const compareRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1400,
+        system: systemCompare,
+        messages: [{
+          role: "user",
+          content: `Client Query: "${transcript}"\n\nClient Intent: "${extracted.clientIntent}"\n\nLive Stock Data:\n${stockSummaries}\n\nJSON only:`,
+        }],
+      }),
+    });
+
+    if (!compareRes.ok) throw new Error(`Claude compare ${compareRes.status}: ${await compareRes.text()}`);
+    const compareData = await compareRes.json();
+    const rawCompare  = (compareData.content || []).map(b => b.text || "").join("");
+    const matchCompare = rawCompare.match(/\{[\s\S]*\}/);
+    if (!matchCompare) throw new Error("Claude returned no JSON for comparison");
+
+    const comparison = JSON.parse(matchCompare[0]);
+
+    // ── Attach rank/signal/recommendation back to enrichedItems ─────────────
+    (comparison.rankings || []).forEach(r => {
+      const item = enrichedItems.find(i => i.ticker === r.ticker);
+      if (item) {
+        item.rank            = r.rank;
+        item.signal          = r.signal;
+        item.recommendation  = r.recommendation;
+        item.score           = r.score;
+        item.oneLineVerdict  = r.oneLineVerdict;
+      }
+    });
+
+    const liveCount = enrichedItems.filter(i => i.liveDataAvailable).length;
+
+    const result = {
+      type:               "comparison",
+      query:              transcript,
+      comparisonContext:  extracted.comparisonContext,
+      clientIntent:       extracted.clientIntent,
+      headline:           comparison.headline,
+      winner:             comparison.winner,
+      items:              enrichedItems,
+      keyTable:           comparison.keyTable || [],
+      comparisonNarrative: comparison.comparisonNarrative,
+      recommendation:     comparison.recommendation,
+      dataSource:         liveCount > 0 ? `Yahoo Finance (live · ${liveCount}/${enrichedItems.length} stocks) + ENAM Portfolio System` : "ENAM Portfolio System (live data unavailable)",
+      portfolioDataSource: "ENAM Internal Portfolio System",
+      lastUpdated: new Date().toLocaleTimeString("en-IN", {
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true,
+      }),
+    };
+
+    console.log(`  Winner: ${result.winner?.ticker} | ${enrichedItems.length} stocks compared\n`);
+    res.json(result);
+
+  } catch (err) {
+    console.error("Compare error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });

@@ -42,3 +42,43 @@ export async function analyzeTranscript(transcript) {
   if (!r.ok) throw new Error(d.error || `Error ${r.status}`);
   return d;
 }
+
+export async function compareStocks(transcript) {
+  const r = await fetch('/api/compare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript }),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || `Error ${r.status}`);
+  return d;
+}
+
+export async function getPortfolio() {
+  const r = await fetch('/api/portfolio');
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || `Error ${r.status}`);
+  return d;
+}
+
+// Returns true when the query is a comparison / portfolio query
+export function isCompareQuery(text) {
+  const t = text.toLowerCase();
+  return (
+    t.includes('compar') ||
+    t.includes(' vs ') ||
+    t.includes(' versus ') ||
+    t.includes('better than') ||
+    t.includes('which stock') ||
+    t.includes('which is better') ||
+    t.includes('portfolio') ||
+    t.includes('our holding') ||
+    t.includes('our stock') ||
+    t.includes('enam') ||
+    t.includes('top performer') ||
+    t.includes('best performer') ||
+    t.includes('worst performer') ||
+    t.includes('rank') ||
+    (t.includes('and') && (t.includes('between') || t.includes('switch') || t.includes('choose')))
+  );
+}
